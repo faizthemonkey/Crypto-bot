@@ -8,3 +8,9 @@ ta==0.10.2
 python-dateutil==2.8.2
 matplotlib==3.8.0
 mplfinance==0.12.9b7
+
+# Futures Trading GUI
+streamlit>=1.28.0
+plotly>=5.18.0
+websocket-client>=1.6.4
+requests>=2.31.0
