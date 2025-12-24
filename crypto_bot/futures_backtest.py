@@ -69,13 +69,15 @@ class BacktestConfig:
     initial_balance: float = 10000.0
     leverage: float = 1.0
     position_size_pct: float = 100.0  # % of balance to use per trade
+    fixed_amount_mode: bool = False  # Use fixed amount instead of percentage
+    fixed_amount: float = 1000.0  # Fixed amount per trade
     maker_fee: float = 0.0002  # 0.02%
     taker_fee: float = 0.0004  # 0.04%
     slippage_pct: float = 0.0  # Slippage percentage
     use_stop_loss: bool = False
-    stop_loss_pct: float = 2.0  # Stop loss percentage
+    stop_loss_pct: float = 2.0  # Stop loss percentage (on margin, accounts for leverage)
     use_take_profit: bool = False
-    take_profit_pct: float = 4.0  # Take profit percentage
+    take_profit_pct: float = 4.0  # Take profit percentage (on margin, accounts for leverage)
 
 
 class FuturesBacktester:
@@ -146,10 +148,11 @@ class FuturesBacktester:
             if self.position.side != PositionSide.FLAT:
                 self._update_unrealized_pnl(current_price)
                 
-                # Check stop loss / take profit
+                # Check stop loss / take profit using high/low prices
                 if self.config.use_stop_loss or self.config.use_take_profit:
-                    if self._check_exit_conditions(row):
-                        self._close_position(current_time, current_price)
+                    exit_price = self._check_exit_conditions(row)
+                    if exit_price is not None:
+                        self._close_position(current_time, exit_price, use_exact_price=True)
             
             # Process signal
             if signal == 1 and self.position.side != PositionSide.LONG:
@@ -205,8 +208,12 @@ class FuturesBacktester:
         else:
             entry_price = price * (1 - self.config.slippage_pct / 100)
         
-        # Calculate position size
-        position_value = self.balance * (self.config.position_size_pct / 100)
+        # Calculate position size based on mode
+        if self.config.fixed_amount_mode:
+            position_value = min(self.config.fixed_amount, self.balance)
+        else:
+            position_value = self.balance * (self.config.position_size_pct / 100)
+        
         margin = position_value / self.config.leverage
         size = position_value / entry_price
         
@@ -233,16 +240,25 @@ class FuturesBacktester:
             leverage=self.config.leverage
         ))
     
-    def _close_position(self, time: datetime, price: float):
-        """Close current position."""
+    def _close_position(self, time: datetime, price: float, use_exact_price: bool = False):
+        """Close current position.
+        
+        Args:
+            time: Exit time
+            price: Exit price
+            use_exact_price: If True, use price exactly (for SL/TP). If False, apply slippage.
+        """
         if self.position.side == PositionSide.FLAT:
             return
         
-        # Apply slippage
-        if self.position.side == PositionSide.LONG:
-            exit_price = price * (1 - self.config.slippage_pct / 100)
+        # Apply slippage only if not using exact price (SL/TP already calculated)
+        if use_exact_price:
+            exit_price = price
         else:
-            exit_price = price * (1 + self.config.slippage_pct / 100)
+            if self.position.side == PositionSide.LONG:
+                exit_price = price * (1 - self.config.slippage_pct / 100)
+            else:
+                exit_price = price * (1 + self.config.slippage_pct / 100)
         
         # Close the trade
         if self.trades and self.trades[-1].is_open:
@@ -265,37 +281,51 @@ class FuturesBacktester:
         
         self.position.unrealized_pnl = price_diff * self.position.size * self.position.leverage
     
-    def _check_exit_conditions(self, row: pd.Series) -> bool:
-        """Check if stop loss or take profit is hit."""
+    def _check_exit_conditions(self, row: pd.Series) -> Optional[float]:
+        """Check if stop loss or take profit is hit.
+        
+        Stop loss % is based on MARGIN loss (accounts for leverage).
+        E.g., 20% SL on 10x leverage = 2% price move triggers stop.
+        
+        Returns:
+            Exit price if SL/TP hit, None otherwise
+        """
         if self.position.side == PositionSide.FLAT:
-            return False
+            return None
         
         entry_price = self.position.entry_price
+        leverage = self.position.leverage
+        
+        # Convert margin-based SL/TP to price-based
+        # SL% on margin = SL% / leverage on price
+        price_sl_pct = self.config.stop_loss_pct / leverage
+        price_tp_pct = self.config.take_profit_pct / leverage
         
         if self.position.side == PositionSide.LONG:
             # For long position
             if self.config.use_stop_loss:
-                stop_price = entry_price * (1 - self.config.stop_loss_pct / 100)
+                stop_price = entry_price * (1 - price_sl_pct / 100)
                 if row['low'] <= stop_price:
-                    return True
+                    # Return the stop price, not the low (worst case execution)
+                    return stop_price
             
             if self.config.use_take_profit:
-                tp_price = entry_price * (1 + self.config.take_profit_pct / 100)
+                tp_price = entry_price * (1 + price_tp_pct / 100)
                 if row['high'] >= tp_price:
-                    return True
+                    return tp_price
         else:
             # For short position
             if self.config.use_stop_loss:
-                stop_price = entry_price * (1 + self.config.stop_loss_pct / 100)
+                stop_price = entry_price * (1 + price_sl_pct / 100)
                 if row['high'] >= stop_price:
-                    return True
+                    return stop_price
             
             if self.config.use_take_profit:
-                tp_price = entry_price * (1 - self.config.take_profit_pct / 100)
+                tp_price = entry_price * (1 - price_tp_pct / 100)
                 if row['low'] <= tp_price:
-                    return True
+                    return tp_price
         
-        return False
+        return None
     
     def _calculate_results(self, data: pd.DataFrame) -> Dict[str, Any]:
         """Calculate comprehensive backtest results."""
@@ -613,7 +643,11 @@ class LivePaperTrader:
         else:
             entry_price *= (1 - self.config.slippage_pct / 100)
         
-        position_value = self.balance * (self.config.position_size_pct / 100)
+        # Calculate position size based on mode
+        if self.config.fixed_amount_mode:
+            position_value = min(self.config.fixed_amount, self.balance)
+        else:
+            position_value = self.balance * (self.config.position_size_pct / 100)
         size = position_value / entry_price
         
         self.position = Position(
@@ -636,6 +670,38 @@ class LivePaperTrader:
         ))
         
         return True
+    
+    def check_stop_loss_take_profit(self, high: float, low: float) -> Optional[float]:
+        """Check if SL/TP is hit using high/low prices. Returns exit price or None."""
+        if self.position.side == PositionSide.FLAT:
+            return None
+        
+        entry_price = self.position.entry_price
+        leverage = self.position.leverage
+        
+        # Convert margin-based SL/TP to price-based
+        price_sl_pct = self.config.stop_loss_pct / leverage
+        price_tp_pct = self.config.take_profit_pct / leverage
+        
+        if self.position.side == PositionSide.LONG:
+            if self.config.use_stop_loss:
+                stop_price = entry_price * (1 - price_sl_pct / 100)
+                if low <= stop_price:
+                    return stop_price
+            if self.config.use_take_profit:
+                tp_price = entry_price * (1 + price_tp_pct / 100)
+                if high >= tp_price:
+                    return tp_price
+        else:
+            if self.config.use_stop_loss:
+                stop_price = entry_price * (1 + price_sl_pct / 100)
+                if high >= stop_price:
+                    return stop_price
+            if self.config.use_take_profit:
+                tp_price = entry_price * (1 - price_tp_pct / 100)
+                if low <= tp_price:
+                    return tp_price
+        return None
     
     def get_stats(self) -> Dict[str, Any]:
         """Get current trading statistics."""
